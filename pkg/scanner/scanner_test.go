@@ -14,8 +14,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/anchore/grype/grype/match"
 	"github.com/anchore/grype/grype/presenter/models"
+	grypeopenvex "github.com/anchore/grype/grype/vex/openvex"
 	"github.com/anchore/syft/syft/sbom"
+	openvex "github.com/openvex/go-vex/pkg/vex"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -172,4 +175,79 @@ func TestScanSBOM(t *testing.T) {
 	assert.True(t, found67499, "expected to find CVE-2025-67499")
 
 	assert.Equal(t, 1, matchesWithoutVex-matchesWithVex)
+}
+
+// findMatch returns the match for the vulnerability ID, if any.
+func findMatch(doc *models.Document, id string) (models.Match, bool) {
+	for _, m := range doc.Matches {
+		if m.Vulnerability.ID == id {
+			return m, true
+		}
+	}
+
+	return models.Match{}, false
+}
+
+// openVEXStatement returns the VEX statement attached to the match by the
+// openvex matcher, if any.
+func openVEXStatement(t *testing.T, m models.Match) (openvex.Statement, bool) {
+	t.Helper()
+
+	for _, d := range m.MatchDetails {
+		if d.Matcher != string(match.OpenVexMatcher) {
+			continue
+		}
+
+		found, ok := d.Found.(grypeopenvex.Match)
+		require.True(t, ok, "unexpected found type %T", d.Found)
+
+		return found.Statement, true
+	}
+
+	return openvex.Statement{}, false
+}
+
+func TestScanSBOMAffected(t *testing.T) {
+	sc, err := scanner.NewScanner(scanner.Options{
+		ID: "test",
+	})
+	require.NoError(t, err)
+
+	t.Cleanup(func() { assert.NoError(t, sc.Close()) })
+
+	t.Run("statement attached to the match", func(t *testing.T) {
+		doc, _, err := sc.ScanSBOM("./testdata/test.spdx.json", nil, "./testdata/67499-affected.json")
+		require.NoError(t, err)
+
+		_, found := findMatch(doc, "CVE-2025-26519")
+		assert.False(t, found, "expected not to find CVE-2025-26519 (fixed)")
+
+		m, found := findMatch(doc, "CVE-2025-67499")
+		require.True(t, found, "expected to find CVE-2025-67499 (affected)")
+
+		statement, found := openVEXStatement(t, m)
+		require.True(t, found, "expected the VEX statement to be attached to the match")
+
+		assert.Equal(t, openvex.StatusAffected, statement.Status)
+		assert.Equal(t, "Only reachable when the CNI plugin is invoked with an attacker-controlled network configuration.", statement.ActionStatement)
+
+		// the statement is a detail of the match, not a replacement for the real one
+		assert.GreaterOrEqual(t, len(m.MatchDetails), 2)
+	})
+
+	t.Run("statement for another product", func(t *testing.T) {
+		doc, _, err := sc.ScanSBOM("./testdata/test.spdx.json", nil, "./testdata/67499-affected-other-product.json")
+		require.NoError(t, err)
+
+		// the fixed statement is for another product too, so the match stays
+		_, found := findMatch(doc, "CVE-2025-26519")
+		assert.True(t, found, "expected to find CVE-2025-26519")
+
+		// the affected statement does not apply, so the match is reported as if there were no VEX data
+		m, found := findMatch(doc, "CVE-2025-67499")
+		require.True(t, found, "expected to find CVE-2025-67499")
+
+		_, found = openVEXStatement(t, m)
+		assert.False(t, found, "expected no VEX statement attached to the match")
+	})
 }

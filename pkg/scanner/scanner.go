@@ -27,6 +27,7 @@ import (
 	"github.com/anchore/grype/grype/vex"
 	"github.com/anchore/grype/grype/vulnerability"
 	"github.com/anchore/syft/syft/sbom"
+	openvex "github.com/openvex/go-vex/pkg/vex"
 	"github.com/wagoodman/go-presenter"
 )
 
@@ -164,6 +165,11 @@ func (sc *Scanner) Close() error {
 }
 
 // ScanSBOM scans an SBOM file from path, using a VEX file to determine significance.
+//
+// Matches with a VEX status of fixed or not_affected are dropped from the report.
+// Matches with a status of affected or under_investigation are kept, and the VEX
+// statement is attached to them as a match detail (matcher "openvex-matcher"),
+// so the action statement and other notes reach the report.
 func (sc *Scanner) ScanSBOM(sbomPath string, timestamp *time.Time, vexPath ...string) (*models.Document, *sbom.SBOM, error) {
 	vexProcessor, err := vex.NewProcessor(vex.ProcessorOptions{
 		Documents: vexPath,
@@ -172,9 +178,15 @@ func (sc *Scanner) ScanSBOM(sbomPath string, timestamp *time.Time, vexPath ...st
 		return nil, nil, fmt.Errorf("error initializing Grype VEX processor: %w", err)
 	}
 
+	ignoreRules, err := affectedIgnoreRules(vexPath)
+	if err != nil {
+		return nil, nil, err
+	}
+
 	vulnMatcher := grype.VulnerabilityMatcher{
 		VulnerabilityProvider: sc.db,
 		VexProcessor:          vexProcessor,
+		IgnoreRules:           ignoreRules,
 		Matchers: []match.Matcher{
 			golang.NewGolangMatcher(golang.MatcherConfig{
 				UseCPEs:               false,
@@ -188,10 +200,12 @@ func (sc *Scanner) ScanSBOM(sbomPath string, timestamp *time.Time, vexPath ...st
 		return nil, nil, fmt.Errorf("error reading SBOM: %w", err)
 	}
 
-	matches, _, err := vulnMatcher.FindMatches(packages, pkgContext)
+	matches, ignoredMatches, err := vulnMatcher.FindMatches(packages, pkgContext)
 	if err != nil {
 		return nil, nil, fmt.Errorf("error scanning SBOM: %w", err)
 	}
+
+	restorePlaceholderIgnored(matches, ignoredMatches)
 
 	modelDocument, err := models.NewDocument(
 		clio.Identification{
@@ -217,4 +231,66 @@ func (sc *Scanner) ScanSBOM(sbomPath string, timestamp *time.Time, vexPath ...st
 	}
 
 	return &modelDocument, s, nil
+}
+
+// placeholderReason marks the ignore rules synthesized from affected VEX
+// statements, so they can be told apart from any other ignore rule.
+const placeholderReason = "placeholder: affected or under_investigation in VEX"
+
+// affectedIgnoreRules returns an ignore rule for each vulnerability (and alias)
+// that the VEX documents mark as affected or under_investigation.
+//
+// Grype only attaches a VEX statement to a match on its augment path, which
+// re-adds a match that was ignored earlier when the VEX data says the product is
+// affected. Without an ignore rule, an affected match passes through the VEX
+// processor untouched and its action statement never reaches the report. The
+// placeholder rules make every such match go through that path.
+func affectedIgnoreRules(vexPath []string) ([]match.IgnoreRule, error) {
+	if len(vexPath) == 0 {
+		return nil, nil
+	}
+
+	doc, err := openvex.MergeFiles(vexPath)
+	if err != nil {
+		return nil, fmt.Errorf("error reading VEX documents: %w", err)
+	}
+
+	var rules []match.IgnoreRule
+
+	for _, statement := range doc.Statements {
+		if statement.Status != openvex.StatusAffected && statement.Status != openvex.StatusUnderInvestigation {
+			continue
+		}
+
+		for _, id := range append([]openvex.VulnerabilityID{statement.Vulnerability.Name}, statement.Vulnerability.Aliases...) {
+			rules = append(rules, match.IgnoreRule{
+				Vulnerability: string(id),
+				Reason:        placeholderReason,
+			})
+		}
+	}
+
+	return rules, nil
+}
+
+// restorePlaceholderIgnored puts back the matches that were ignored only by the
+// placeholder rules and that no VEX statement re-added: the statement is for a
+// vulnerability with that name, but it does not apply to the scanned product
+// (or package), so the match has to be reported as if there were no VEX data.
+func restorePlaceholderIgnored(matches *match.Matches, ignoredMatches []match.IgnoredMatch) {
+	for _, ignored := range ignoredMatches {
+		onlyPlaceholder := len(ignored.AppliedIgnoreRules) > 0
+
+		for _, rule := range ignored.AppliedIgnoreRules {
+			if rule.Reason != placeholderReason {
+				onlyPlaceholder = false
+
+				break
+			}
+		}
+
+		if onlyPlaceholder {
+			matches.Add(ignored.Match)
+		}
+	}
 }
